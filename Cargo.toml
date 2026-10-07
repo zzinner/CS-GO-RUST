@@ -1,0 +1,17 @@
+[package]
+name = "kisak-strike-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.14", features = ["wav"] }
+bevy_rapier3d = "0.27"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+vformats = { version = "0.1", default-features = false, features = ["mdl", "vmt", "vtf"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
