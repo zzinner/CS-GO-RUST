@@ -13,7 +13,8 @@ use bevy::{
 
 use crate::{
     assets_loader::{AppState, SourceAssetConfig, SourceAssetManager},
-    movement::{DEFAULT_MAX_RUN_SPEED, Player, PlayerControlSet},
+    bsp::{MapLoadRequest, MapLoadResult},
+    movement::{Player, PlayerControlSet},
     weapon::WeaponSystems,
 };
 
@@ -34,6 +35,7 @@ impl Plugin for ConsolePlugin {
                     .in_set(ConsoleSet)
                     .run_if(in_state(AppState::InGame)),
             )
+            .add_systems(Update, report_map_load_results)
             .add_systems(Update, discard_gameplay_input_during_loader);
     }
 }
@@ -49,11 +51,11 @@ fn discard_gameplay_input_during_loader(
     }
 }
 
-fn parse_autobunnyhopping(value: &str) -> Result<bool, String> {
+fn parse_bunnyhopping_setting(value: &str, name: &str) -> Result<bool, String> {
     match value {
         "0" => Ok(false),
         "1" => Ok(true),
-        _ => Err("sv_autobunnyhopping expects 0 or 1".to_string()),
+        _ => Err(format!("{name} expects 0 or 1")),
     }
 }
 
@@ -63,22 +65,26 @@ pub(super) struct ConsoleSet;
 #[derive(Resource, Debug)]
 pub(super) struct ConVars {
     pub(super) gravity: f32,
+    pub(super) jump_impulse: f32,
     pub(super) friction: f32,
     pub(super) accelerate: f32,
     pub(super) air_accelerate: f32,
     pub(super) max_speed: f32,
     pub(super) autobunnyhopping: bool,
+    pub(super) enable_bunnyhopping: bool,
 }
 
 impl Default for ConVars {
     fn default() -> Self {
         Self {
-            gravity: 16.0,
+            gravity: 800.0,
+            jump_impulse: 301.993_38,
             friction: 5.2,
             accelerate: 5.5,
             air_accelerate: 12.0,
-            max_speed: DEFAULT_MAX_RUN_SPEED,
+            max_speed: 320.0,
             autobunnyhopping: false,
+            enable_bunnyhopping: false,
         }
     }
 }
@@ -186,6 +192,7 @@ fn handle_console_input(
     mut assets: ResMut<SourceAssetConfig>,
     asset_manager: Res<SourceAssetManager>,
     mut players: Query<&mut Player>,
+    mut map_requests: EventWriter<MapLoadRequest>,
 ) {
     console.closed_this_frame = false;
     let was_open = console.open;
@@ -234,6 +241,7 @@ fn handle_console_input(
                     &mut assets,
                     &asset_manager,
                     &mut players,
+                    &mut map_requests,
                 );
             }
         }
@@ -285,6 +293,7 @@ fn handle_console_input(
                 &mut assets,
                 &asset_manager,
                 &mut players,
+                &mut map_requests,
             );
             if console.open {
                 break;
@@ -300,6 +309,7 @@ fn execute_command(
     assets: &mut SourceAssetConfig,
     asset_manager: &SourceAssetManager,
     players: &mut Query<&mut Player>,
+    map_requests: &mut EventWriter<MapLoadRequest>,
 ) {
     let tokens = match parse_tokens(line) {
         Ok(tokens) => tokens,
@@ -336,6 +346,9 @@ fn execute_command(
             None => Err(format!("unknown key: {}", tokens[1])),
         },
         "sv_gravity" => set_float_convar(&tokens, "sv_gravity", &mut convars.gravity, false),
+        "sv_jump_impulse" => {
+            set_float_convar(&tokens, "sv_jump_impulse", &mut convars.jump_impulse, true)
+        }
         "sv_friction" => set_float_convar(&tokens, "sv_friction", &mut convars.friction, false),
         "sv_accelerate" => {
             set_float_convar(&tokens, "sv_accelerate", &mut convars.accelerate, false)
@@ -348,9 +361,15 @@ fn execute_command(
         ),
         "sv_maxspeed" => set_float_convar(&tokens, "sv_maxspeed", &mut convars.max_speed, true),
         "sv_autobunnyhopping" if tokens.len() == 2 => {
-            parse_autobunnyhopping(&tokens[1]).map(|enabled| {
+            parse_bunnyhopping_setting(&tokens[1], "sv_autobunnyhopping").map(|enabled| {
                 convars.autobunnyhopping = enabled;
                 format!("sv_autobunnyhopping = {}", u8::from(enabled))
+            })
+        }
+        "sv_enablebunnyhopping" if tokens.len() == 2 => {
+            parse_bunnyhopping_setting(&tokens[1], "sv_enablebunnyhopping").map(|enabled| {
+                convars.enable_bunnyhopping = enabled;
+                format!("sv_enablebunnyhopping = {}", u8::from(enabled))
             })
         }
         "noclip" if tokens.len() == 1 => match players.get_single_mut() {
@@ -395,13 +414,27 @@ fn execute_command(
                 ))
             })
         }
-        "map" if tokens.len() == 2 => asset_manager.request_map(&tokens[1]),
+        "map" if tokens.len() == 2 => asset_manager.request_map(&tokens[1]).map(|_| {
+            map_requests.send(MapLoadRequest {
+                map_name: tokens[1].clone(),
+            });
+            format!("Loading map {}...", tokens[1])
+        }),
         _ => Err(format!("unknown command or invalid arguments: {line}")),
     };
 
     match result {
         Ok(message) => console.history.push(message),
         Err(error) => console.history.push(format!("Error: {error}")),
+    }
+}
+
+fn report_map_load_results(
+    mut results: EventReader<MapLoadResult>,
+    mut console: ResMut<ConsoleState>,
+) {
+    for result in results.read() {
+        console.history.push(result.message.clone());
     }
 }
 
@@ -658,8 +691,35 @@ mod tests {
             .is_ok()
         );
         assert_eq!(vars.gravity, 800.0);
-        assert_eq!(parse_autobunnyhopping("1"), Ok(true));
-        assert_eq!(parse_autobunnyhopping("0"), Ok(false));
-        assert!(parse_autobunnyhopping("true").is_err());
+        assert!(
+            set_float_convar(
+                &["sv_jump_impulse".to_string(), "300".to_string()],
+                "sv_jump_impulse",
+                &mut vars.jump_impulse,
+                true
+            )
+            .is_ok()
+        );
+        assert_eq!(vars.jump_impulse, 300.0);
+        assert_eq!(vars.max_speed, 320.0);
+        assert!(
+            set_float_convar(
+                &["sv_maxspeed".to_string(), "250".to_string()],
+                "sv_maxspeed",
+                &mut vars.max_speed,
+                true
+            )
+            .is_ok()
+        );
+        assert_eq!(vars.max_speed, 250.0);
+        assert_eq!(
+            parse_bunnyhopping_setting("1", "sv_autobunnyhopping"),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_bunnyhopping_setting("0", "sv_enablebunnyhopping"),
+            Ok(false)
+        );
+        assert!(parse_bunnyhopping_setting("true", "sv_autobunnyhopping").is_err());
     }
 }

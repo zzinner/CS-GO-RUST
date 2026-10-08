@@ -15,7 +15,7 @@ use crate::{
     audio_system::SoundCue,
     console::{ConVars, ConsoleState},
     environment::Solid,
-    movement::{Player, PlayerControlSet},
+    movement::{Player, PlayerControlSet, SOURCE_WORLD_SCALE},
     target::{HitGroup, Hitbox, SHOT_DAMAGE, Target, scaled_damage},
 };
 
@@ -552,8 +552,10 @@ fn fire_hitscan(
     let shot_rotation = view_rotation(&player);
     let camera_forward = shot_rotation * Vec3::NEG_Z;
     let horizontal_speed = Vec2::new(player.velocity.x, player.velocity.z).length();
-    let movement_inaccuracy =
-        (horizontal_speed / convars.max_speed).clamp(0.0, 1.0) * weapon.inaccuracy_move;
+    let movement_inaccuracy = (horizontal_speed
+        / (convars.max_speed.min(weapon.max_player_speed) * SOURCE_WORLD_SCALE))
+        .clamp(0.0, 1.0)
+        * weapon.inaccuracy_move;
     let airborne_inaccuracy = if player.grounded {
         0.0
     } else {

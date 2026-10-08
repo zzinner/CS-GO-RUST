@@ -27,7 +27,7 @@ const VPK_SIGNATURE: u32 = 0x55aa_1234;
 const VPK_INLINE_ARCHIVE: u16 = 0x7fff;
 const MAX_VPK_TREE_SIZE: usize = 128 * 1024 * 1024;
 const MAX_VPK_ENTRIES: usize = 2_000_000;
-const BSP_HEADER_SIZE: usize = 1036;
+pub(super) const BSP_HEADER_SIZE: usize = 1036;
 
 pub(super) struct SourceAssetLoaderPlugin {
     bootstrap: Bootstrap,
@@ -142,14 +142,11 @@ impl SourceAssetManager {
     }
 
     pub(super) fn request_map(&self, map_name: &str) -> Result<String, String> {
-        if map_name.is_empty() || map_name.contains(['/', '\\', ':']) || map_name.contains("..") {
-            return Err("map expects a simple map name such as de_dust2".to_string());
-        }
+        let entry_path = map_entry_path(map_name)?;
         let index = self
             .index
             .as_ref()
             .ok_or_else(|| "Source depot is not mounted yet".to_string())?;
-        let entry_path = format!("maps/{}.bsp", map_name.to_ascii_lowercase());
         if !index.lookup.contains_key(&entry_path) {
             return Err(format!(
                 "Map {map_name} was not found in the mounted VPK directory"
@@ -162,10 +159,35 @@ impl SourceAssetManager {
         {
             return Err(format!("Map {map_name} has no validated BSP header"));
         }
-        Ok(format!(
-            "Map {map_name} is indexed and its BSP header is valid; BSP rendering is the next implementation phase"
-        ))
+        Ok(format!("Map {map_name} is available"))
     }
+
+    pub(super) fn read_map(&self, map_name: &str) -> Result<Vec<u8>, String> {
+        let entry_path = map_entry_path(map_name)?;
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| "Source depot is not mounted yet".to_string())?;
+        if !index
+            .validated_bsp_headers
+            .iter()
+            .any(|name| name == &entry_path)
+        {
+            return Err(format!("Map {map_name} has no validated BSP header"));
+        }
+        if let Some(path) = index.local_maps.get(&entry_path) {
+            return std::fs::read(path)
+                .map_err(|error| format!("Could not read map {}: {error}", path.display()));
+        }
+        read_vpk_entry(index, &entry_path)
+    }
+}
+
+fn map_entry_path(map_name: &str) -> Result<String, String> {
+    if map_name.is_empty() || map_name.contains(['/', '\\', ':']) || map_name.contains("..") {
+        return Err("map expects a simple map name such as de_dust2".to_string());
+    }
+    Ok(format!("maps/{}.bsp", map_name.to_ascii_lowercase()))
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +209,7 @@ struct VpkDirectoryIndex {
     entries: Vec<VpkEntry>,
     lookup: HashMap<String, usize>,
     validated_bsp_headers: Vec<String>,
+    local_maps: HashMap<String, PathBuf>,
 }
 
 #[derive(Resource, Default)]
@@ -217,6 +240,9 @@ struct SetupStatusText;
 
 #[derive(Component)]
 struct VerifyDepotButton;
+
+#[derive(Component)]
+struct SkipDepotButton;
 
 #[derive(Component)]
 struct IndexStatusText;
@@ -328,7 +354,7 @@ fn spawn_setup_screen(
     });
     root.with_children(|root| {
         root.spawn(TextBundle::from_section(
-            "Kisak Strike Rust — Depot Setup",
+            "Kisak Strike Rust — Setup",
             TextStyle {
                 font_size: 34.0,
                 color: Color::WHITE,
@@ -336,7 +362,7 @@ fn spawn_setup_screen(
             },
         ));
         root.spawn(TextBundle::from_section(
-            "Укажите путь к папке Steam Depot (содержащей /csgo/pak01_dir.vpk)",
+            "Подключать Steam Depot необязательно. Укажите его путь или пропустите для запуска демо-карты.",
             TextStyle {
                 font_size: 20.0,
                 color: Color::srgb(0.82, 0.86, 0.92),
@@ -395,6 +421,30 @@ fn spawn_setup_screen(
             ));
         });
         root.spawn((
+            ButtonBundle {
+                style: Style {
+                    width: Val::Px(320.0),
+                    height: Val::Px(52.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                background_color: Color::srgb(0.2, 0.27, 0.39).into(),
+                ..default()
+            },
+            SkipDepotButton,
+        ))
+        .with_children(|button| {
+            button.spawn(TextBundle::from_section(
+                "Пропустить — запустить демо-карту",
+                TextStyle {
+                    font_size: 18.0,
+                    color: Color::WHITE,
+                    ..default()
+                },
+            ));
+        });
+        root.spawn((
             TextBundle::from_section(
                 setup.status.clone(),
                 TextStyle {
@@ -415,10 +465,19 @@ fn handle_setup_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut fields: Query<&Interaction, (With<SetupPathField>, Changed<Interaction>)>,
     buttons: Query<&Interaction, (With<VerifyDepotButton>, Changed<Interaction>)>,
+    skip_buttons: Query<&Interaction, (With<SkipDepotButton>, Changed<Interaction>)>,
     mut setup: ResMut<SetupUiState>,
     mut config: ResMut<SourceAssetConfig>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
+    if skip_buttons
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
+    {
+        next_state.set(AppState::InGame);
+        return;
+    }
+
     for interaction in &mut fields {
         if *interaction == Interaction::Pressed {
             setup.path_focused = true;
@@ -429,14 +488,23 @@ fn handle_setup_input(
         .any(|interaction| *interaction == Interaction::Pressed)
         || (setup.path_focused && keys.just_pressed(KeyCode::Enter));
 
+    let control_pressed = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let mut paste_handled = false;
     for event in keyboard.read() {
         if !setup.path_focused || event.state != bevy::input::ButtonState::Pressed {
             continue;
         }
         if event.key_code == KeyCode::Backspace {
             setup.path.pop();
+        } else if event.key_code == KeyCode::KeyV && control_pressed {
+            if !paste_handled {
+                paste_handled = true;
+                paste_setup_path(&mut setup);
+            }
+        } else if event.key_code == KeyCode::Space {
+            append_setup_space(&mut setup.path);
         } else if let bevy::input::keyboard::Key::Character(character) = &event.logical_key {
-            if character.chars().all(|character| !character.is_control()) {
+            if !control_pressed && character.chars().all(|character| !character.is_control()) {
                 setup.path.push_str(character);
             }
         }
@@ -460,6 +528,28 @@ fn handle_setup_input(
         },
         Err(error) => setup.status = error,
     }
+}
+
+fn paste_setup_path(setup: &mut SetupUiState) {
+    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+        Ok(text) => {
+            setup.path.push_str(&sanitize_pasted_path(&text));
+            setup.status.clear();
+        }
+        Err(error) => {
+            setup.status = format!("Не удалось вставить путь из буфера обмена: {error}");
+        }
+    }
+}
+
+fn append_setup_space(path: &mut String) {
+    path.push(' ');
+}
+
+fn sanitize_pasted_path(text: &str) -> String {
+    text.chars()
+        .filter(|character| !matches!(character, '\r' | '\n' | '\0'))
+        .collect()
 }
 
 fn update_setup_screen(
@@ -661,6 +751,7 @@ fn index_vpk_directory(
     processed: Arc<AtomicUsize>,
     estimated: Arc<AtomicUsize>,
 ) -> Result<VpkDirectoryIndex, String> {
+    // 1. Открываем и парсим сам VPK файл (pak01_dir.vpk) для звуков, моделей и оружия
     let mut file = File::open(directory_path)
         .map_err(|error| format!("Could not open {}: {error}", directory_path.display()))?;
     let file_size = file
@@ -712,19 +803,17 @@ fn index_vpk_directory(
     let mut tree = vec![0; tree_size];
     file.read_exact(&mut tree)
         .map_err(|error| format!("Could not read VPK directory tree: {error}"))?;
+
+    // Парсим дерево файлов внутри VPK
     let entries = parse_vpk_tree(&tree, data_size, &processed, &estimated)?;
     if entries.is_empty() {
         return Err("VPK directory tree contains no files".to_string());
     }
 
+    // Собираем базовый хэш-мап для быстрого поиска ассетов
     let mut lookup = HashMap::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
-        if lookup
-            .insert(entry.path.to_ascii_lowercase(), index)
-            .is_some()
-        {
-            return Err(format!("Duplicate VPK path: {}", entry.path));
-        }
+        let _ = lookup.insert(entry.path.to_ascii_lowercase(), index);
         if entry.archive_index != VPK_INLINE_ARCHIVE {
             let archive_path = archive_path_for(directory_path, entry.archive_index);
             let archive_size = archive_path
@@ -757,7 +846,10 @@ fn index_vpk_directory(
         entries,
         lookup,
         validated_bsp_headers: Vec::new(),
+        local_maps: HashMap::new(),
     };
+
+    // 2. Ищем встроенные карты внутри самого VPK
     let bsp_entries: Vec<usize> = index
         .entries
         .iter()
@@ -770,18 +862,64 @@ fn index_vpk_directory(
         .collect();
     for entry_index in bsp_entries {
         let entry = &index.entries[entry_index];
-        validate_bsp_entry(
+        if validate_bsp_entry(
             &index.directory_path,
             index.header_size,
             index.tree_size,
             entry,
-        )?;
-        index
-            .validated_bsp_headers
-            .push(entry.path.to_ascii_lowercase());
+        )
+        .is_ok()
+        {
+            index
+                .validated_bsp_headers
+                .push(entry.path.to_ascii_lowercase());
+        }
     }
+
+    // 3. ДОПОЛНИТЕЛЬНО сканируем реальную физическую папку csgo/maps на диске
+    let csgo_root = directory_path.parent().unwrap_or_else(|| Path::new("."));
+    let real_maps_dir = csgo_root.join("maps");
+    if real_maps_dir.is_dir() {
+        if let Ok(dir_entries) = std::fs::read_dir(&real_maps_dir) {
+            for entry in dir_entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("bsp") {
+                    if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                        let virtual_path = format!("maps/{}", file_name.to_ascii_lowercase());
+
+                        // Если карты еще нет в индексе, проверяем и добавляем её
+                        if !index.lookup.contains_key(&virtual_path) {
+                            if let Ok(mut file) = File::open(&path) {
+                                let mut header = vec![0; BSP_HEADER_SIZE];
+                                if file.read_exact(&mut header).is_ok() {
+                                    if let Ok(file_size) = path.metadata().map(|m| m.len()) {
+                                        if validate_bsp_header(&header, file_size).is_ok() {
+                                            // Создаем фейковую VpkEntry, чтобы логика request_map и lookup работали без ошибок
+                                            let fake_index = index.entries.len();
+                                            index.entries.push(VpkEntry {
+                                                path: virtual_path.clone(),
+                                                _crc32: 0,
+                                                preload: Vec::new(),
+                                                archive_index: VPK_INLINE_ARCHIVE,
+                                                offset: 0,
+                                                length: 0,
+                                            });
+                                            index.lookup.insert(virtual_path.clone(), fake_index);
+                                            index.validated_bsp_headers.push(virtual_path.clone());
+                                            index.local_maps.insert(virtual_path, path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if index.validated_bsp_headers.is_empty() {
-        return Err("VPK directory contains no maps/*.bsp entries".to_string());
+        return Err("No valid maps (*.bsp) found in VPK or local directory.".to_string());
     }
     Ok(index)
 }
@@ -1320,7 +1458,7 @@ fn validate_bsp_entry(
     validate_bsp_header(&prefix, entry_size).map_err(|error| format!("{}: {error}", entry.path))
 }
 
-fn validate_bsp_header(header: &[u8], file_size: u64) -> Result<(), String> {
+pub(super) fn validate_bsp_header(header: &[u8], file_size: u64) -> Result<(), String> {
     if header.len() < BSP_HEADER_SIZE {
         return Err("header is truncated".to_string());
     }
@@ -1351,6 +1489,18 @@ fn validate_bsp_header(header: &[u8], file_size: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_path_input_keeps_spaces_and_cleans_clipboard_line_breaks() {
+        let mut path = String::from("C:\\Program Files");
+        append_setup_space(&mut path);
+        path.push_str("Steam\\steamapps\\common\\CSGO");
+        assert_eq!(path, "C:\\Program Files Steam\\steamapps\\common\\CSGO");
+        assert_eq!(
+            sanitize_pasted_path("\"C:\\Program Files\\CSGO\"\r\n"),
+            "\"C:\\Program Files\\CSGO\""
+        );
+    }
 
     fn vtf_fixture(high_format: u32, payload_size: usize) -> Vec<u8> {
         let mut bytes = vec![0_u8; 65 + payload_size];
@@ -1504,6 +1654,7 @@ mod tests {
                 entries,
                 lookup,
                 validated_bsp_headers: Vec::new(),
+                local_maps: HashMap::new(),
             };
             let manager = SourceAssetManager {
                 mounted_root: Some(csgo.clone()),
@@ -1581,7 +1732,13 @@ mod tests {
         bsp[4..8].copy_from_slice(&20_u32.to_le_bytes());
         let mut tree = Vec::new();
         tree.extend_from_slice(b"bsp\0maps\0de_dust2\0");
-        tree.extend_from_slice(&vpk_record(VPK_INLINE_ARCHIVE, 0, bsp.len() as u32));
+        tree.extend_from_slice(&vpk_record_with_preload(
+            crc32(&bsp),
+            VPK_INLINE_ARCHIVE,
+            0,
+            bsp.len() as u32,
+            &[],
+        ));
         tree.extend_from_slice(b"\0\0\0");
 
         let mut archive = Vec::new();
@@ -1612,8 +1769,9 @@ mod tests {
             manager
                 .request_map("de_dust2")
                 .unwrap()
-                .contains("header is valid")
+                .contains("is available")
         );
+        assert_eq!(manager.read_map("de_dust2").unwrap(), bsp);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1661,6 +1819,33 @@ mod tests {
         let manager = SourceAssetManager::default();
         assert!(manager.request_map("de_dust2").is_err());
         assert!(manager.request_map("../de_dust2").is_err());
+    }
+
+    #[test]
+    fn map_reader_loads_a_map_indexed_from_the_local_maps_directory() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let map_path = root.join("de_dust2.bsp");
+        let bytes = b"validated local map".to_vec();
+        std::fs::write(&map_path, &bytes).unwrap();
+        let entry_path = "maps/de_dust2.bsp".to_string();
+        let index = VpkDirectoryIndex {
+            directory_path: root.join("pak01_dir.vpk"),
+            version: 1,
+            header_size: 12,
+            tree_size: 0,
+            entries: Vec::new(),
+            lookup: HashMap::from([(entry_path.clone(), 0)]),
+            validated_bsp_headers: vec![entry_path.clone()],
+            local_maps: HashMap::from([(entry_path, map_path)]),
+        };
+        let manager = SourceAssetManager {
+            mounted_root: Some(root.clone()),
+            index: Some(Arc::new(index)),
+        };
+
+        assert_eq!(manager.read_map("de_dust2").unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

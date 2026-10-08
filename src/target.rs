@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::environment::{Solid, SurfacePhysics};
+use crate::environment::{DemoEnvironment, Solid, SurfacePhysics};
 
 pub(super) const SHOT_DAMAGE: u16 = 34;
 
@@ -62,6 +62,7 @@ pub(super) fn spawn_target(
             TransformBundle::from_transform(Transform::from_translation(position)),
             VisibilityBundle::default(),
             Target { health: 100 },
+            DemoEnvironment,
         ))
         .with_children(|target| {
             spawn_hitbox(

@@ -1,5 +1,6 @@
 mod assets_loader;
 mod audio_system;
+mod bsp;
 mod console;
 mod environment;
 mod hud;
@@ -22,6 +23,7 @@ fn main() {
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin)
         .add_plugins(assets_loader::SourceAssetLoaderPlugin::new())
+        .add_plugins(bsp::BspMapPlugin)
         .add_plugins(console::ConsolePlugin)
         .add_plugins((
             environment::EnvironmentPlugin,

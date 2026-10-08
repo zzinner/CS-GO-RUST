@@ -5,6 +5,9 @@ use crate::target::spawn_target;
 
 pub(super) struct EnvironmentPlugin;
 
+#[derive(Component)]
+pub(super) struct DemoEnvironment;
+
 impl Plugin for EnvironmentPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ClearColor(Color::srgb(0.47, 0.62, 0.69)))
@@ -85,15 +88,17 @@ fn setup_environment(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            illuminance: 12_000.0,
-            shadows_enabled: true,
+    commands
+        .spawn(DirectionalLightBundle {
+            directional_light: DirectionalLight {
+                illuminance: 12_000.0,
+                shadows_enabled: true,
+                ..default()
+            },
+            transform: Transform::from_xyz(-6.0, 12.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
             ..default()
-        },
-        transform: Transform::from_xyz(-6.0, 12.0, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
-        ..default()
-    });
+        })
+        .insert(DemoEnvironment);
     commands.insert_resource(AmbientLight {
         color: Color::srgb(0.78, 0.84, 0.9),
         brightness: 180.0,
@@ -239,6 +244,7 @@ fn spawn_ramp(
             transform,
             ..default()
         },
+        DemoEnvironment,
         Solid {
             half_extents: world_half_extents,
             surface,
@@ -263,12 +269,15 @@ fn spawn_box(
     size: Vec3,
     surface: Option<SurfacePhysics>,
 ) {
-    let mut entity = commands.spawn(PbrBundle {
-        mesh: meshes.add(Cuboid::new(size.x, size.y, size.z)),
-        material,
-        transform: Transform::from_translation(position),
-        ..default()
-    });
+    let mut entity = commands.spawn((
+        PbrBundle {
+            mesh: meshes.add(Cuboid::new(size.x, size.y, size.z)),
+            material,
+            transform: Transform::from_translation(position),
+            ..default()
+        },
+        DemoEnvironment,
+    ));
 
     if let Some(surface) = surface {
         entity.insert(Solid {

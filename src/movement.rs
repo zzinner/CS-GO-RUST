@@ -10,21 +10,23 @@ use crate::console::{ConVars, ConsoleSet, ConsoleState};
 use crate::environment::{Solid, SurfacePhysics, SurfaceType, WalkablePlane};
 use crate::weapon::{DemoWeapon, WeaponState};
 
-const PLAYER_EYE_HEIGHT_STANDING: f32 = 1.65;
-const PLAYER_EYE_HEIGHT_CROUCHED: f32 = 1.05;
-const PLAYER_RADIUS: f32 = 0.35;
-const PLAYER_TOP_OFFSET: f32 = 0.12;
 pub(super) const DEFAULT_MAX_RUN_SPEED: f32 = 5.2;
+pub(super) const SOURCE_WORLD_SCALE: f32 = DEFAULT_MAX_RUN_SPEED / 250.0;
 const CROUCH_SPEED_FACTOR: f32 = 0.34;
 const WALK_SPEED_FACTOR: f32 = 0.52;
-const CROUCH_DURATION: f32 = 0.4;
-const DUCK_FATIGUE_PER_TOGGLE: f32 = 0.75;
-const DUCK_FATIGUE_RECOVERY: f32 = 0.35;
-const MAX_DUCK_FATIGUE: f32 = 2.5;
+pub(super) const PLAYER_EYE_HEIGHT_STANDING: f32 = 64.0 * SOURCE_WORLD_SCALE;
+const PLAYER_EYE_HEIGHT_CROUCHED: f32 = 28.0 * SOURCE_WORLD_SCALE;
+const PLAYER_STANDING_HULL_HEIGHT: f32 = 72.0 * SOURCE_WORLD_SCALE;
+const PLAYER_CROUCHED_HULL_HEIGHT: f32 = 36.0 * SOURCE_WORLD_SCALE;
+const PLAYER_RADIUS: f32 = 16.0 * SOURCE_WORLD_SCALE;
+const CROUCH_SPEED: f32 = 8.0;
+const CROUCH_SPAM_SPEED_PENALTY: f32 = 2.0;
+const CROUCH_SPEED_RECOVERY: f32 = 3.0;
+const CROUCH_MOVEMENT_RECOVERY: f32 = 6.0;
+const CROUCH_RECOVERY_DISTANCE: f32 = 64.0 * SOURCE_WORLD_SCALE;
 const JUMP_BUFFER_FRAMES: f32 = 2.0;
-const AIR_WISH_SPEED_CAP: f32 = 0.6;
-const STOP_SPEED: f32 = 1.6;
-const JUMP_HEIGHT: f32 = 1.125;
+const AIR_WISH_SPEED_CAP: f32 = SOURCE_WORLD_SCALE * 30.0;
+const STOP_SPEED: f32 = 80.0 * SOURCE_WORLD_SCALE;
 const MOUSE_SENSITIVITY: f32 = 0.002;
 const MIN_MOVEMENT_SPEED: f32 = 0.01;
 const MAX_FRAME_TIME: f32 = 0.05;
@@ -65,11 +67,13 @@ pub(super) struct Player {
     pub(super) health: u16,
     pub(super) crouch_fraction: f32,
     pub(super) eye_height: f32,
+    crouched_hull: bool,
     pub(super) walking: bool,
     footstep_timer: f32,
     pub(super) noclip: bool,
-    duck_timer: f32,
+    duck_speed: f32,
     duck_pressed: bool,
+    last_position_at_full_crouch_speed: Vec2,
     jump_buffer_timer: f32,
     pub(super) ground_surface: SurfacePhysics,
     pub(super) ground_normal: Vec3,
@@ -86,11 +90,13 @@ impl Default for Player {
             health: 100,
             crouch_fraction: 0.0,
             eye_height: PLAYER_EYE_HEIGHT_STANDING,
+            crouched_hull: false,
             walking: false,
             footstep_timer: 0.0,
             noclip: false,
-            duck_timer: 0.0,
+            duck_speed: CROUCH_SPEED,
             duck_pressed: false,
+            last_position_at_full_crouch_speed: Vec2::ZERO,
             jump_buffer_timer: 0.0,
             ground_surface: SurfacePhysics {
                 friction: 1.0,
@@ -194,42 +200,63 @@ fn update_player(
 
     let delta_seconds = time.delta_seconds().min(MAX_FRAME_TIME);
     let crouch_requested = keys.pressed(KeyCode::ControlLeft);
-    if crouch_requested != player.duck_pressed {
-        player.duck_timer = (player.duck_timer + DUCK_FATIGUE_PER_TOGGLE).min(MAX_DUCK_FATIGUE);
-        player.duck_pressed = crouch_requested;
-    }
-    player.duck_timer = (player.duck_timer - DUCK_FATIGUE_RECOVERY * delta_seconds).max(0.0);
-    let target_crouch_fraction = if crouch_requested { 1.0 } else { 0.0 };
-    let next_crouch_fraction = update_crouch_fraction(
-        player.crouch_fraction,
-        target_crouch_fraction,
+    let duck_toggled = crouch_requested != player.duck_pressed;
+    player.duck_pressed = crouch_requested;
+    let horizontal_position = Vec2::new(transform.translation.x, transform.translation.z);
+    let moved_away_from_crouch_point = (player.crouch_fraction <= 0.0
+        || player.crouch_fraction >= 1.0)
+        && horizontal_position.distance_squared(player.last_position_at_full_crouch_speed)
+            > CROUCH_RECOVERY_DISTANCE.powi(2);
+    player.duck_speed = update_duck_speed(
+        player.duck_speed,
+        duck_toggled,
         delta_seconds,
-        player.duck_timer,
+        moved_away_from_crouch_point,
     );
-    if next_crouch_fraction < player.crouch_fraction {
+    if player.duck_speed >= CROUCH_SPEED {
+        player.last_position_at_full_crouch_speed = horizontal_position;
+    }
+    let target_crouch_fraction = if crouch_requested { 1.0 } else { 0.0 };
+    let mut animation_target = target_crouch_fraction;
+    let mut next_hull_is_crouched = player.crouched_hull;
+    if crouch_requested && !player.grounded {
+        next_hull_is_crouched = true;
+    } else if !crouch_requested && !player.grounded {
+        next_hull_is_crouched = false;
+    } else if target_crouch_fraction == 0.0 && player.crouch_fraction > 0.0 && !player.noclip {
         let standing_position =
             transform.translation + Vec3::Y * (PLAYER_EYE_HEIGHT_STANDING - player.eye_height);
-        if !player.noclip
-            && position_blocked(standing_position, PLAYER_EYE_HEIGHT_STANDING, &solids)
-        {
-            player.crouch_fraction = player.crouch_fraction.max(next_crouch_fraction);
+        if position_blocked(
+            standing_position,
+            PLAYER_EYE_HEIGHT_STANDING,
+            PLAYER_STANDING_HULL_HEIGHT,
+            &solids,
+        ) {
+            animation_target = 1.0;
+            next_hull_is_crouched = true;
         } else {
-            player.crouch_fraction = next_crouch_fraction;
+            next_hull_is_crouched = false;
         }
-    } else {
-        player.crouch_fraction = next_crouch_fraction;
     }
+    let next_crouch_fraction = update_crouch_fraction(
+        player.crouch_fraction,
+        animation_target,
+        delta_seconds,
+        player.duck_speed,
+    );
+    player.crouched_hull = next_hull_is_crouched
+        || (player.grounded && crouch_requested && next_crouch_fraction >= 1.0);
+    player.crouch_fraction = next_crouch_fraction;
+    let view_fraction = simple_spline(player.crouch_fraction);
     let next_eye_height = PLAYER_EYE_HEIGHT_STANDING
-        + (PLAYER_EYE_HEIGHT_CROUCHED - PLAYER_EYE_HEIGHT_STANDING) * player.crouch_fraction;
+        + (PLAYER_EYE_HEIGHT_CROUCHED - PLAYER_EYE_HEIGHT_STANDING) * view_fraction;
     transform.translation.y += next_eye_height - player.eye_height;
     player.eye_height = next_eye_height;
 
-    let max_speed = convars.max_speed * (weapon.max_player_speed / 250.0);
-    let mut wish_speed = max_speed;
+    let max_speed = convars.max_speed.min(weapon.max_player_speed) * SOURCE_WORLD_SCALE;
+    let mut wish_speed = max_speed * duck_speed_modifier(player.crouch_fraction);
     player.walking = false;
-    if crouch_requested {
-        wish_speed = crouch_wish_speed(wish_speed);
-    } else if keys.pressed(KeyCode::ShiftLeft) {
+    if keys.pressed(KeyCode::ShiftLeft) && player.crouch_fraction == 0.0 {
         wish_speed *= WALK_SPEED_FACTOR;
         player.walking = true;
     }
@@ -271,7 +298,7 @@ fn update_player(
 
     if player.grounded {
         let surface_friction = player.ground_surface.friction;
-        let gravity = Vec3::NEG_Y * convars.gravity;
+        let gravity = Vec3::NEG_Y * convars.gravity * SOURCE_WORLD_SCALE;
         let slope_acceleration =
             (gravity - player.ground_normal * gravity.dot(player.ground_normal)) * delta_seconds;
         player.velocity.x += slope_acceleration.x;
@@ -288,15 +315,16 @@ fn update_player(
             wish_speed,
             surface_friction,
             convars.accelerate,
-            max_speed,
             delta_seconds,
         );
     } else {
+        let surface_friction = player.ground_surface.friction;
         accelerate_air(
             &mut player.velocity,
             wish_direction,
             wish_speed,
             convars.air_accelerate,
+            surface_friction,
             delta_seconds,
         );
     }
@@ -307,7 +335,13 @@ fn update_player(
         player.jump_buffer_timer > 0.0
     };
     if player.grounded && jump_requested {
-        player.velocity.y = jump_impulse(convars.gravity, player.ground_surface.jump_factor);
+        if !convars.enable_bunnyhopping {
+            cap_bunny_jump_speed(&mut player.velocity, max_speed);
+        }
+        player.velocity.y = jump_impulse(
+            convars.jump_impulse * SOURCE_WORLD_SCALE,
+            player.ground_surface.jump_factor,
+        );
         player.grounded = false;
         player.jump_buffer_timer = 0.0;
     }
@@ -327,8 +361,7 @@ fn update_player(
         &mut player,
         delta_seconds,
         stepped_up,
-        jump_requested,
-        &convars,
+        convars.gravity * SOURCE_WORLD_SCALE,
         &solids,
     );
     let hard_landing = !was_grounded && player.grounded && landing_speed < -2.0;
@@ -384,7 +417,7 @@ fn update_noclip(
         direction -= Vec3::Y;
     }
     direction = direction.normalize_or_zero();
-    player.velocity = direction * convars.max_speed;
+    player.velocity = direction * convars.max_speed * SOURCE_WORLD_SCALE;
     transform.translation += player.velocity * delta_seconds;
     player.grounded = false;
 }
@@ -393,13 +426,36 @@ fn move_towards(current: f32, target: f32, max_delta: f32) -> f32 {
     current + (target - current).clamp(-max_delta, max_delta)
 }
 
-fn update_crouch_fraction(current: f32, target: f32, delta_seconds: f32, fatigue: f32) -> f32 {
-    let transition_time = CROUCH_DURATION * (1.0 + fatigue.clamp(0.0, MAX_DUCK_FATIGUE));
-    move_towards(current, target, delta_seconds / transition_time)
+fn update_crouch_fraction(current: f32, target: f32, delta_seconds: f32, duck_speed: f32) -> f32 {
+    let speed = if target > current {
+        duck_speed * 0.8
+    } else {
+        duck_speed.max(1.5)
+    };
+    move_towards(current, target, delta_seconds * speed)
 }
 
-fn crouch_wish_speed(base_speed: f32) -> f32 {
-    base_speed * CROUCH_SPEED_FACTOR
+fn update_duck_speed(
+    current: f32,
+    duck_toggled: bool,
+    delta_seconds: f32,
+    moved_away_from_crouch_point: bool,
+) -> f32 {
+    let speed_after_toggle = if duck_toggled {
+        (current - CROUCH_SPAM_SPEED_PENALTY).max(0.0)
+    } else {
+        current
+    };
+    let recovery = if moved_away_from_crouch_point {
+        CROUCH_MOVEMENT_RECOVERY
+    } else {
+        CROUCH_SPEED_RECOVERY
+    };
+    move_towards(speed_after_toggle, CROUCH_SPEED, recovery * delta_seconds)
+}
+
+fn duck_speed_modifier(duck_fraction: f32) -> f32 {
+    1.0 + (CROUCH_SPEED_FACTOR - 1.0) * duck_fraction.clamp(0.0, 1.0)
 }
 
 fn update_jump_buffer(timer: f32, just_pressed: bool, delta_seconds: f32) -> f32 {
@@ -410,23 +466,11 @@ fn update_jump_buffer(timer: f32, just_pressed: bool, delta_seconds: f32) -> f32
     }
 }
 
-fn cap_landing_speed(velocity: &mut Vec3, max_speed: f32) {
-    let horizontal_speed = Vec2::new(velocity.x, velocity.z).length();
-    if horizontal_speed > max_speed {
-        let scale = max_speed / horizontal_speed;
-        velocity.x *= scale;
-        velocity.z *= scale;
-    }
-}
-
-fn cap_landing_speed_if_needed(
-    velocity: &mut Vec3,
-    max_speed: f32,
-    grounded: bool,
-    jump_requested: bool,
-) {
-    if grounded && !jump_requested {
-        cap_landing_speed(velocity, max_speed);
+fn cap_bunny_jump_speed(velocity: &mut Vec3, max_speed: f32) {
+    let speed = velocity.length();
+    let max_bunny_jump_speed = max_speed * 1.1;
+    if speed > max_bunny_jump_speed {
+        *velocity *= max_bunny_jump_speed / speed;
     }
 }
 
@@ -456,7 +500,6 @@ fn accelerate_ground(
     wish_speed: f32,
     surface_friction: f32,
     acceleration: f32,
-    max_speed: f32,
     dt: f32,
 ) {
     if wish_speed <= 0.0 || wish_direction == Vec3::ZERO {
@@ -469,7 +512,7 @@ fn accelerate_ground(
         return;
     }
 
-    let acceleration_step = acceleration * max_speed * surface_friction * dt;
+    let acceleration_step = acceleration * wish_speed * surface_friction * dt;
     *velocity += wish_direction * acceleration_step.min(speed_to_add);
 }
 
@@ -478,6 +521,7 @@ fn accelerate_air(
     wish_direction: Vec3,
     wish_speed: f32,
     acceleration: f32,
+    surface_friction: f32,
     dt: f32,
 ) {
     if wish_speed <= 0.0 || wish_direction == Vec3::ZERO {
@@ -490,12 +534,12 @@ fn accelerate_air(
         return;
     }
 
-    let acceleration_step = acceleration * wish_speed * dt;
+    let acceleration_step = acceleration * wish_speed * surface_friction * dt;
     *velocity += wish_direction * acceleration_step.min(speed_to_add);
 }
 
-fn jump_impulse(gravity: f32, jump_factor: f32) -> f32 {
-    (2.0 * gravity * JUMP_HEIGHT * jump_factor).sqrt()
+fn jump_impulse(source_impulse: f32, jump_factor: f32) -> f32 {
+    source_impulse * jump_factor
 }
 
 fn move_horizontally(
@@ -517,9 +561,13 @@ fn move_horizontally(
             break;
         }
 
-        let Some((fraction, normal)) =
-            earliest_horizontal_collision(transform.translation, delta, player.eye_height, solids)
-        else {
+        let Some((fraction, normal)) = earliest_horizontal_collision(
+            transform.translation,
+            delta,
+            player.eye_height,
+            player_hull_height(player.crouched_hull),
+            solids,
+        ) else {
             transform.translation += delta;
             break;
         };
@@ -536,6 +584,7 @@ fn move_horizontally(
                 before_step,
                 normal,
                 player.eye_height,
+                player_hull_height(player.crouched_hull),
                 player.grounded,
                 wish_direction,
                 wish_speed,
@@ -567,13 +616,12 @@ fn move_vertically(
     player: &mut Player,
     dt: f32,
     stepped_up: bool,
-    jump_requested: bool,
-    convars: &ConVars,
+    gravity: f32,
     solids: &Query<(&GlobalTransform, &Solid), Without<Player>>,
 ) {
     let previous_y = transform.translation.y;
     let was_grounded = player.grounded;
-    player.velocity.y -= convars.gravity * dt;
+    player.velocity.y -= gravity * dt;
     let mut next_y = previous_y + player.velocity.y * dt;
     player.grounded = false;
 
@@ -606,14 +654,6 @@ fn move_vertically(
                 player.ground_normal = normal;
                 player.velocity.y = 0.0;
                 player.grounded = true;
-                if !was_grounded {
-                    cap_landing_speed_if_needed(
-                        &mut player.velocity,
-                        convars.max_speed,
-                        true,
-                        jump_requested,
-                    );
-                }
             }
         }
     } else {
@@ -627,10 +667,11 @@ fn move_vertically(
             }
 
             let solid_bottom = solid_transform.translation().y - solid.half_extents.y;
-            let previous_top = previous_y + PLAYER_TOP_OFFSET;
-            let next_top = next_y + PLAYER_TOP_OFFSET;
+            let hull_height = player_hull_height(player.crouched_hull);
+            let previous_top = previous_y - player.eye_height + hull_height;
+            let next_top = next_y - player.eye_height + hull_height;
             if previous_top <= solid_bottom && next_top >= solid_bottom {
-                next_y = next_y.min(solid_bottom - PLAYER_TOP_OFFSET);
+                next_y = next_y.min(solid_bottom + player.eye_height - hull_height);
                 player.velocity.y = 0.0;
                 player.ground_normal = Vec3::Y;
             }
@@ -644,6 +685,7 @@ fn earliest_horizontal_collision(
     origin: Vec3,
     delta: Vec3,
     eye_height: f32,
+    hull_height: f32,
     solids: &Query<(&GlobalTransform, &Solid), Without<Player>>,
 ) -> Option<(f32, Vec3)> {
     let mut nearest: Option<(f32, Vec3)> = None;
@@ -651,7 +693,7 @@ fn earliest_horizontal_collision(
     for (transform, solid) in solids.iter() {
         let min = Vec3::new(
             transform.translation().x - solid.half_extents.x - PLAYER_RADIUS,
-            transform.translation().y - solid.half_extents.y - PLAYER_TOP_OFFSET,
+            transform.translation().y - solid.half_extents.y + eye_height - hull_height,
             transform.translation().z - solid.half_extents.z - PLAYER_RADIUS,
         );
         let max = Vec3::new(
@@ -727,6 +769,7 @@ fn try_step_up(
     original_position: Vec3,
     wall_normal: Vec3,
     eye_height: f32,
+    hull_height: f32,
     grounded: bool,
     wish_direction: Vec3,
     wish_speed: f32,
@@ -737,7 +780,7 @@ fn try_step_up(
     }
 
     let raised = *position + Vec3::Y * STEP_HEIGHT;
-    if position_blocked(raised, eye_height, solids) {
+    if position_blocked(raised, eye_height, hull_height, solids) {
         return false;
     }
 
@@ -748,7 +791,7 @@ fn try_step_up(
             break;
         }
         let Some((fraction, normal)) =
-            earliest_horizontal_collision(candidate, remaining, eye_height, solids)
+            earliest_horizontal_collision(candidate, remaining, eye_height, hull_height, solids)
         else {
             candidate += remaining;
             break;
@@ -777,7 +820,7 @@ fn try_step_up(
         return false;
     };
 
-    if position_blocked(candidate, eye_height, solids) {
+    if position_blocked(candidate, eye_height, hull_height, solids) {
         return false;
     }
 
@@ -810,8 +853,10 @@ fn step_landing_position(
 fn position_blocked(
     position: Vec3,
     eye_height: f32,
+    hull_height: f32,
     solids: &Query<(&GlobalTransform, &Solid), Without<Player>>,
 ) -> bool {
+    let (player_min, player_max) = player_bounds(position, eye_height, hull_height);
     solids.iter().any(|(transform, solid)| {
         if solid.walkable_plane.is_some() {
             return false;
@@ -819,23 +864,45 @@ fn position_blocked(
 
         let min = transform.translation() - solid.half_extents;
         let max = transform.translation() + solid.half_extents;
-        let player_min = Vec3::new(
+        bounds_intersect(player_min, player_max, min, max)
+    })
+}
+
+fn player_bounds(position: Vec3, eye_height: f32, hull_height: f32) -> (Vec3, Vec3) {
+    (
+        Vec3::new(
             position.x - PLAYER_RADIUS,
             position.y - eye_height,
             position.z - PLAYER_RADIUS,
-        );
-        let player_max = Vec3::new(
+        ),
+        Vec3::new(
             position.x + PLAYER_RADIUS,
-            position.y + PLAYER_TOP_OFFSET,
+            position.y - eye_height + hull_height,
             position.z + PLAYER_RADIUS,
-        );
-        player_min.x < max.x
-            && player_max.x > min.x
-            && player_min.y < max.y
-            && player_max.y > min.y
-            && player_min.z < max.z
-            && player_max.z > min.z
-    })
+        ),
+    )
+}
+
+fn player_hull_height(crouched_hull: bool) -> f32 {
+    if crouched_hull {
+        PLAYER_CROUCHED_HULL_HEIGHT
+    } else {
+        PLAYER_STANDING_HULL_HEIGHT
+    }
+}
+
+fn simple_spline(fraction: f32) -> f32 {
+    let fraction = fraction.clamp(0.0, 1.0);
+    fraction * fraction * (3.0 - 2.0 * fraction)
+}
+
+fn bounds_intersect(a_min: Vec3, a_max: Vec3, b_min: Vec3, b_max: Vec3) -> bool {
+    a_min.x < b_max.x
+        && a_max.x > b_min.x
+        && a_min.y < b_max.y
+        && a_max.y > b_min.y
+        && a_min.z < b_max.z
+        && a_max.z > b_min.z
 }
 
 fn support_surface_at(
@@ -942,7 +1009,6 @@ mod tests {
             DEFAULT_MAX_RUN_SPEED,
             1.0,
             5.5,
-            DEFAULT_MAX_RUN_SPEED,
             0.015,
         );
         assert!(velocity.x > 0.0);
@@ -959,7 +1025,6 @@ mod tests {
                 DEFAULT_MAX_RUN_SPEED,
                 1.0,
                 5.5,
-                DEFAULT_MAX_RUN_SPEED,
                 0.015,
             );
         }
@@ -967,14 +1032,80 @@ mod tests {
     }
 
     #[test]
+    fn ground_acceleration_scales_with_walk_and_crouch_speed() {
+        let mut normal = Vec3::ZERO;
+        let mut walking = Vec3::ZERO;
+        let mut crouching = Vec3::ZERO;
+        accelerate_ground(&mut normal, Vec3::X, DEFAULT_MAX_RUN_SPEED, 1.0, 5.5, 0.015);
+        accelerate_ground(
+            &mut walking,
+            Vec3::X,
+            DEFAULT_MAX_RUN_SPEED * WALK_SPEED_FACTOR,
+            1.0,
+            5.5,
+            0.015,
+        );
+        accelerate_ground(
+            &mut crouching,
+            Vec3::X,
+            DEFAULT_MAX_RUN_SPEED * CROUCH_SPEED_FACTOR,
+            1.0,
+            5.5,
+            0.015,
+        );
+        assert!((walking.x / normal.x - WALK_SPEED_FACTOR).abs() < 0.0001);
+        assert!((crouching.x / normal.x - CROUCH_SPEED_FACTOR).abs() < 0.0001);
+    }
+
+    #[test]
     fn air_acceleration_limits_speed_added_in_the_wish_direction() {
         let mut velocity = Vec3::ZERO;
-        accelerate_air(&mut velocity, Vec3::X, DEFAULT_MAX_RUN_SPEED, 12.0, 0.015);
+        accelerate_air(
+            &mut velocity,
+            Vec3::X,
+            DEFAULT_MAX_RUN_SPEED,
+            12.0,
+            1.0,
+            0.015,
+        );
         assert!((velocity.x - AIR_WISH_SPEED_CAP).abs() < 0.001);
 
         let previous_speed = velocity.length();
-        accelerate_air(&mut velocity, Vec3::X, DEFAULT_MAX_RUN_SPEED, 12.0, 0.015);
+        accelerate_air(
+            &mut velocity,
+            Vec3::X,
+            DEFAULT_MAX_RUN_SPEED,
+            12.0,
+            1.0,
+            0.015,
+        );
         assert!((velocity.length() - previous_speed).abs() < 0.001);
+    }
+
+    #[test]
+    fn air_acceleration_uses_surface_friction() {
+        let mut normal_surface_velocity = Vec3::ZERO;
+        let mut low_friction_velocity = Vec3::ZERO;
+
+        accelerate_air(
+            &mut normal_surface_velocity,
+            Vec3::X,
+            DEFAULT_MAX_RUN_SPEED,
+            6.0,
+            1.0,
+            0.015,
+        );
+        accelerate_air(
+            &mut low_friction_velocity,
+            Vec3::X,
+            DEFAULT_MAX_RUN_SPEED,
+            6.0,
+            0.5,
+            0.015,
+        );
+
+        assert!(low_friction_velocity.x < normal_surface_velocity.x);
+        assert!((low_friction_velocity.x * 2.0 - normal_surface_velocity.x).abs() < 0.001);
     }
 
     #[test]
@@ -1010,8 +1141,12 @@ mod tests {
 
     #[test]
     fn jump_surface_factor_scales_takeoff_impulse() {
-        assert!(jump_impulse(16.0, 1.2) > jump_impulse(16.0, 0.8));
-        assert!((jump_impulse(16.0, 1.0) - (2.0 * 16.0 * JUMP_HEIGHT).sqrt()).abs() < 0.0001);
+        let source_impulse = 301.993_38;
+        let impulse = jump_impulse(source_impulse * SOURCE_WORLD_SCALE, 1.0);
+        assert!((impulse / SOURCE_WORLD_SCALE - source_impulse).abs() < 0.0001);
+        assert!((jump_impulse(impulse, 1.2) - impulse * 1.2).abs() < 0.0001);
+        let jump_height = impulse.powi(2) / (2.0 * 800.0 * SOURCE_WORLD_SCALE);
+        assert!((jump_height / SOURCE_WORLD_SCALE - 57.0).abs() < 0.01);
     }
 
     #[test]
@@ -1074,31 +1209,130 @@ mod tests {
     }
 
     #[test]
-    fn landing_speed_is_reduced_only_when_player_stays_grounded_without_jump_input() {
-        let mut velocity = Vec3::new(10.0, -3.0, 0.0);
-        cap_landing_speed_if_needed(&mut velocity, DEFAULT_MAX_RUN_SPEED, true, false);
-        assert!((Vec2::new(velocity.x, velocity.z).length() - DEFAULT_MAX_RUN_SPEED).abs() < 0.001);
-        assert_eq!(velocity.y, -3.0);
+    fn bunny_jump_speed_is_capped_before_takeoff_unless_enabled() {
+        let max_speed = DEFAULT_MAX_RUN_SPEED;
+        let mut capped_velocity = Vec3::X * (max_speed * 1.5);
+        cap_bunny_jump_speed(&mut capped_velocity, max_speed);
+        assert!((capped_velocity.length() - max_speed * 1.1).abs() < 0.001);
 
-        let mut bunnyhop_velocity = Vec3::new(10.0, 0.0, 0.0);
-        cap_landing_speed_if_needed(&mut bunnyhop_velocity, DEFAULT_MAX_RUN_SPEED, true, true);
-        assert_eq!(bunnyhop_velocity.x, 10.0);
-
-        let mut airborne_velocity = Vec3::new(10.0, 0.0, 0.0);
-        cap_landing_speed_if_needed(&mut airborne_velocity, DEFAULT_MAX_RUN_SPEED, false, false);
-        assert_eq!(airborne_velocity.x, 10.0);
+        let mut below_cap = Vec3::X * max_speed;
+        cap_bunny_jump_speed(&mut below_cap, max_speed);
+        assert_eq!(below_cap, Vec3::X * max_speed);
     }
 
     #[test]
-    fn crouch_speed_and_fatigue_slow_the_transition() {
+    fn crouch_transition_matches_counter_strike_duck_speeds() {
+        let crouching = update_crouch_fraction(0.0, 1.0, 0.1, CROUCH_SPEED);
+        let uncrouching = update_crouch_fraction(1.0, 0.0, 0.1, CROUCH_SPEED);
+        assert!((crouching - 0.64).abs() < 0.0001);
+        assert!((uncrouching - 0.2).abs() < 0.0001);
+    }
+
+    #[test]
+    fn crouch_camera_fraction_advances_smoothly_in_air_and_under_blocked_ceiling() {
+        let from_air = update_crouch_fraction(0.2, 1.0, 1.0 / 60.0, CROUCH_SPEED);
+        let from_ceiling_release = update_crouch_fraction(0.2, 1.0, 1.0 / 60.0, CROUCH_SPEED);
+        assert!((from_air - 0.2).abs() < 0.2);
+        assert!(from_air < 1.0);
+        assert_eq!(from_air, from_ceiling_release);
+
+        let eased_eye = simple_spline(from_air);
+        assert!(eased_eye > simple_spline(0.2));
+        assert!(eased_eye < 1.0);
+    }
+
+    #[test]
+    fn repeated_duck_toggles_slow_crouch_and_speed_recovers_over_time() {
+        let initial_speed = CROUCH_SPEED;
+        let after_toggle = update_duck_speed(initial_speed, true, 0.0, false);
+        assert_eq!(after_toggle, initial_speed - CROUCH_SPAM_SPEED_PENALTY);
+        let normal_duck = update_crouch_fraction(0.0, 1.0, 0.1, initial_speed);
+        let penalized_duck = update_crouch_fraction(0.0, 1.0, 0.1, after_toggle);
+        assert!(penalized_duck < normal_duck);
+
+        let after_recovery = update_duck_speed(after_toggle, false, 0.5, false);
+        assert!(after_recovery > after_toggle);
+        assert!(after_recovery < initial_speed);
+
+        let after_movement_recovery = update_duck_speed(after_toggle, false, 0.5, true);
+        assert_eq!(after_movement_recovery, initial_speed);
+    }
+
+    #[test]
+    fn initial_duck_press_uses_source_spam_penalty_and_duck_animation_rate() {
+        let tick = 1.0 / 64.0;
+        let duck_speed = update_duck_speed(CROUCH_SPEED, true, tick, false);
+        let fraction = update_crouch_fraction(0.0, 1.0, tick, duck_speed);
         assert!(
-            (crouch_wish_speed(DEFAULT_MAX_RUN_SPEED) - DEFAULT_MAX_RUN_SPEED * 0.34).abs()
-                < 0.0001
+            (duck_speed - (CROUCH_SPEED - CROUCH_SPAM_SPEED_PENALTY + 3.0 * tick)).abs() < 0.0001
         );
-        let normal_progress = update_crouch_fraction(0.0, 1.0, 0.1, 0.0);
-        let fatigued_progress = update_crouch_fraction(0.0, 1.0, 0.1, 2.0);
-        assert!((normal_progress - 0.25).abs() < 0.0001);
-        assert!(fatigued_progress < normal_progress);
+        assert!((fraction - duck_speed * 0.8 * tick).abs() < 0.0001);
+    }
+
+    #[test]
+    fn crouch_changes_player_hull_height_and_preserves_floor_contact() {
+        let floor = 0.0;
+        let standing_origin = Vec3::new(0.0, floor + PLAYER_EYE_HEIGHT_STANDING, 0.0);
+        let crouched_origin = Vec3::new(0.0, floor + PLAYER_EYE_HEIGHT_CROUCHED, 0.0);
+        let (standing_min, standing_max) = player_bounds(
+            standing_origin,
+            PLAYER_EYE_HEIGHT_STANDING,
+            player_hull_height(false),
+        );
+        let (crouched_min, crouched_max) = player_bounds(
+            crouched_origin,
+            PLAYER_EYE_HEIGHT_CROUCHED,
+            player_hull_height(true),
+        );
+
+        assert!((standing_min.y - floor).abs() < 0.0001);
+        assert!((crouched_min.y - floor).abs() < 0.0001);
+        assert!(((standing_max.y - standing_min.y) / SOURCE_WORLD_SCALE - 72.0).abs() < 0.001);
+        assert!(((crouched_max.y - crouched_min.y) / SOURCE_WORLD_SCALE - 36.0).abs() < 0.001);
+        assert!(crouched_max.y < standing_max.y);
+
+        let low_ceiling_min = Vec3::new(-1.0, crouched_max.y + 0.01, -1.0);
+        let low_ceiling_max = Vec3::new(1.0, standing_max.y + 1.0, 1.0);
+        assert!(!bounds_intersect(
+            crouched_min,
+            crouched_max,
+            low_ceiling_min,
+            low_ceiling_max
+        ));
+        assert!(bounds_intersect(
+            standing_min,
+            standing_max,
+            low_ceiling_min,
+            low_ceiling_max
+        ));
+
+        let mid_eye_height = PLAYER_EYE_HEIGHT_STANDING
+            + (PLAYER_EYE_HEIGHT_CROUCHED - PLAYER_EYE_HEIGHT_STANDING) * simple_spline(0.5);
+        let mid_origin = Vec3::new(0.0, floor + mid_eye_height, 0.0);
+        let (mid_min, mid_max) =
+            player_bounds(mid_origin, mid_eye_height, player_hull_height(false));
+        assert!(bounds_intersect(
+            mid_min,
+            mid_max,
+            low_ceiling_min,
+            low_ceiling_max
+        ));
+    }
+
+    #[test]
+    fn crouch_camera_uses_source_simple_spline_easing() {
+        assert!((simple_spline(0.0)).abs() < 0.0001);
+        assert!((simple_spline(0.25) - 0.15625).abs() < 0.0001);
+        assert!((simple_spline(0.5) - 0.5).abs() < 0.0001);
+        assert!((simple_spline(0.75) - 0.84375).abs() < 0.0001);
+        assert!((simple_spline(1.0) - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn crouch_speed_modifier_blends_to_counter_strike_duck_speed() {
+        assert!((duck_speed_modifier(0.0) - 1.0).abs() < 0.0001);
+        assert!((duck_speed_modifier(1.0) - CROUCH_SPEED_FACTOR).abs() < 0.0001);
+        assert!((duck_speed_modifier(0.5) - 0.67).abs() < 0.0001);
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     assets_loader::AppState,
-    console::{ConVars, ConsoleState},
-    movement::Player,
+    console::ConsoleState,
+    movement::{Player, SOURCE_WORLD_SCALE},
     weapon::{MAGAZINE_SIZE, WeaponState},
 };
 
@@ -115,15 +115,14 @@ fn setup_hud(mut commands: Commands) {
     ));
 }
 
-fn source_units_per_second(horizontal_speed: f32, max_speed: f32) -> f32 {
-    horizontal_speed * (250.0 / max_speed.max(f32::EPSILON))
+fn source_units_per_second(horizontal_speed: f32) -> f32 {
+    horizontal_speed / SOURCE_WORLD_SCALE
 }
 
 fn update_hud(
     players: Query<(&Player, &Transform)>,
     weapons: Query<&WeaponState>,
     console: Res<ConsoleState>,
-    convars: Res<ConVars>,
     diagnostics: Res<DiagnosticsStore>,
     backend_label: Res<BackendLabel>,
     mut health_text: Query<
@@ -166,7 +165,7 @@ fn update_hud(
         }
         if let Ok(mut text) = speed_text.get_single_mut() {
             let horizontal_speed = Vec2::new(player.velocity.x, player.velocity.z).length();
-            let source_speed = source_units_per_second(horizontal_speed, convars.max_speed);
+            let source_speed = source_units_per_second(horizontal_speed);
             text.sections[0].value = format!("SPEED: {:03.0} u/s", source_speed);
         }
         if let Ok(mut text) = debug_text.get_single_mut() {
@@ -224,6 +223,6 @@ mod tests {
 
     #[test]
     fn normal_run_speed_maps_to_250_source_units_per_second() {
-        assert!((source_units_per_second(5.2, 5.2) - 250.0).abs() < 0.001);
+        assert!((source_units_per_second(5.2) - 250.0).abs() < 0.001);
     }
 }
